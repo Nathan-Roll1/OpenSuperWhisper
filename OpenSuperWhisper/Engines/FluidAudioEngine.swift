@@ -116,7 +116,7 @@ class FluidAudioEngine: TranscriptionEngine {
     func getSupportedLanguages() -> [String] {
         LanguageUtil.supportedLanguages(
             engine: "fluidaudio",
-            fluidAudioModelVersion: AppPreferences.shared.fluidAudioModelVersion
+            fluidAudioModelVersion: versionString
         )
     }
 }

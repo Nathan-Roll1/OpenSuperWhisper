@@ -80,4 +80,27 @@ final class OrukeetModelStoreTests: XCTestCase {
         XCTAssertFalse(OrukeetModelStore.installed(at: destination))
         XCTAssertThrowsError(try OrukeetModelStore.load(from: destination))
     }
+    @MainActor
+    func testRealEngineRepeatedTranscriptionAndCachedReload() async throws {
+        guard let path = ProcessInfo.processInfo.environment["ORUKEET_AUDIO_DIR"] else {
+            throw XCTSkip("Set ORUKEET_AUDIO_DIR to opt into a real Hugging Face install and audio smoke test")
+        }
+        let directory = URL(fileURLWithPath: path)
+        var previous: [String: String] = [:]
+        for round in 0..<2 {
+            let engine = FluidAudioEngine(modelVersion: "orukeet")
+            try await engine.initialize()
+            XCTAssertTrue(engine.isModelLoaded)
+            XCTAssertEqual(Set(engine.getSupportedLanguages()).count, 25)
+            for name in ["en", "de", "fr", "silence"] {
+                let start = Date()
+                let text = try await engine.transcribeAudio(url: directory.appendingPathComponent(name + ".wav"), settings: Settings())
+                if name == "silence" { XCTAssertTrue(text.isEmpty) } else { XCTAssertFalse(text.isEmpty) }
+                if let expected = previous[name] { XCTAssertEqual(text, expected) }
+                previous[name] = text
+                print("ORUKEET_SMOKE round=\(round) clip=\(name) seconds=\(Date().timeIntervalSince(start)) text=\(text)")
+            }
+        }
+    }
+
 }
