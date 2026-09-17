@@ -211,20 +211,14 @@ enum OrukeetModelStore {
         try commitInstallation(from: bundle, to: destination)
     }
 
-    /// Keep the previous installation available for rollback if the final rename fails.
+    /// Replace the installed directory without a gap that can strand a previous cache.
     static func commitInstallation(from bundle: URL, to destination: URL) throws {
         let files = FileManager.default
-        let backup = destination.deletingLastPathComponent()
-            .appendingPathComponent(".previous-\(UUID().uuidString)", isDirectory: true)
-        let hadPrevious = files.fileExists(atPath: destination.path)
-        if hadPrevious { try files.moveItem(at: destination, to: backup) }
-        do {
+        if files.fileExists(atPath: destination.path) {
+            _ = try files.replaceItemAt(destination, withItemAt: bundle, options: .usingNewMetadataOnly)
+        } else {
             try files.moveItem(at: bundle, to: destination)
-        } catch {
-            if hadPrevious { try files.moveItem(at: backup, to: destination) }
-            throw error
         }
-        if hadPrevious { try? files.removeItem(at: backup) }
     }
 
     static func load(from directory: URL) throws -> AsrModels {
@@ -280,20 +274,88 @@ enum OrukeetModelStore {
 
 /// Coalesce model preparation so selecting a model during a download cannot start
 /// another transfer or replace a directory while the first install is compiling.
-private actor OrukeetInstallation {
+actor OrukeetInstallation {
     static let shared = OrukeetInstallation()
-    private var task: Task<Void, Error>?
+
+    private struct Waiter {
+        let continuation: CheckedContinuation<Void, Error>
+        let progress: @Sendable (Double) -> Void
+    }
+    private struct Installation {
+        let id: UUID
+        let task: Task<Void, Error>
+        var waiters: [UUID: Waiter]
+        var progress: Double = 0
+    }
+
+    private var installation: Installation?
+    private let operation: @Sendable (@escaping @Sendable (Double) -> Void) async throws -> Void
+
+    init(
+        operation: @escaping @Sendable (@escaping @Sendable (Double) -> Void) async throws -> Void = { progress in
+            guard !OrukeetModelStore.isInstalled else { return }
+            try await OrukeetModelStore.install(progress: progress)
+        }
+    ) {
+        self.operation = operation
+    }
 
     func install(progress: @escaping @Sendable (Double) -> Void) async throws {
-        if let task { return try await task.value }
-        guard !OrukeetModelStore.isInstalled else { return }
-        let task = Task { try await OrukeetModelStore.install(progress: progress) }
-        self.task = task
-        defer { self.task = nil }
-        try await withTaskCancellationHandler {
-            try await task.value
-        } onCancel: {
-            task.cancel()
+        // A cancelled last waiter may still be unwinding network/compilation work.
+        // Finish cleanup before another caller can start writing the same directory.
+        while let current = installation, current.task.isCancelled {
+            let result = await current.task.result
+            finish(id: current.id, result: result)
         }
+        try Task.checkCancellation()
+        let waiterID = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                guard !Task.isCancelled else {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                let waiter = Waiter(continuation: continuation, progress: progress)
+                if installation != nil {
+                    installation?.waiters[waiterID] = waiter
+                    progress(installation?.progress ?? 0)
+                    return
+                }
+                let id = UUID()
+                let task = Task {
+                    try await operation { fraction in
+                        Task { await self.reportProgress(fraction, id: id) }
+                    }
+                }
+                installation = Installation(id: id, task: task, waiters: [waiterID: waiter])
+                progress(0)
+                Task {
+                    let result = await task.result
+                    finish(id: id, result: result)
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelWaiter(id: waiterID) }
+        }
+        try Task.checkCancellation()
+    }
+
+    private func reportProgress(_ fraction: Double, id: UUID) {
+        guard var current = installation, current.id == id else { return }
+        current.progress = min(1, max(current.progress, fraction))
+        installation = current
+        for waiter in current.waiters.values { waiter.progress(current.progress) }
+    }
+
+    private func cancelWaiter(id: UUID) {
+        guard let waiter = installation?.waiters.removeValue(forKey: id) else { return }
+        waiter.continuation.resume(throwing: CancellationError())
+        if let current = installation, current.waiters.isEmpty { current.task.cancel() }
+    }
+
+    private func finish(id: UUID, result: Result<Void, Error>) {
+        guard let current = installation, current.id == id else { return }
+        installation = nil
+        for waiter in current.waiters.values { waiter.continuation.resume(with: result) }
     }
 }

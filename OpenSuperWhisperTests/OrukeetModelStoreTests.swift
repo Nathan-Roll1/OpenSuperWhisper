@@ -56,6 +56,129 @@ final class OrukeetModelStoreTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: marker), Data("previous".utf8))
     }
 
+    func testReplacementCommitsNewContentsWithoutLeavingBackup() throws {
+        let directory = try temporaryDirectory()
+        let destination = directory.appendingPathComponent("installed")
+        let replacement = directory.appendingPathComponent("replacement")
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: replacement, withIntermediateDirectories: true)
+        try Data("old".utf8).write(to: destination.appendingPathComponent("model"))
+        try Data("new".utf8).write(to: replacement.appendingPathComponent("model"))
+        try OrukeetModelStore.commitInstallation(from: replacement, to: destination)
+        XCTAssertEqual(try Data(contentsOf: destination.appendingPathComponent("model")), Data("new".utf8))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), ["installed"])
+    }
+
+    func testCancellingFirstCallerPreservesOtherWaiterAndProgress() async throws {
+        try await checkSharedCancellation(cancelFirst: true)
+    }
+
+    func testCancellingSecondCallerPreservesFirstWaiterAndProgress() async throws {
+        try await checkSharedCancellation(cancelFirst: false)
+    }
+
+    private func checkSharedCancellation(cancelFirst: Bool) async throws {
+        let gate = OrukeetInstallationTestGate()
+        let started = expectation(description: "one shared installation")
+        started.assertForOverFulfill = true
+        let firstJoined = expectation(description: "first subscriber")
+        let secondJoined = expectation(description: "second subscriber")
+        let survivorProgress = expectation(description: "remaining subscriber receives progress")
+        let cancelledReturned = expectation(description: "cancelled subscriber returns promptly")
+        let installation = OrukeetInstallation { progress in
+            started.fulfill()
+            await gate.wait()
+            try Task.checkCancellation()
+            progress(0.5)
+            // Let the relayed progress reach the remaining waiter before completing.
+            await gate.waitForProgress()
+        }
+        let first = Task {
+            do {
+                try await installation.install { value in
+                    if value == 0 { firstJoined.fulfill() }
+                    if value == 0.5 && !cancelFirst {
+                        survivorProgress.fulfill()
+                        Task { await gate.progressReceived() }
+                    }
+                }
+            } catch {
+                if cancelFirst { cancelledReturned.fulfill() }
+                throw error
+            }
+        }
+        await fulfillment(of: [firstJoined, started], timeout: 2)
+        let second = Task {
+            do {
+                try await installation.install { value in
+                    if value == 0 { secondJoined.fulfill() }
+                    if value == 0.5 && cancelFirst {
+                        survivorProgress.fulfill()
+                        Task { await gate.progressReceived() }
+                    }
+                }
+            } catch {
+                if !cancelFirst { cancelledReturned.fulfill() }
+                throw error
+            }
+        }
+        await fulfillment(of: [secondJoined], timeout: 2)
+        let cancelled = cancelFirst ? first : second
+        let survivor = cancelFirst ? second : first
+        cancelled.cancel()
+        await fulfillment(of: [cancelledReturned], timeout: 2)
+        await gate.open()
+        await fulfillment(of: [survivorProgress], timeout: 2)
+        // Also unblock a failing implementation so the test does not leave a task suspended.
+        await gate.progressReceived()
+        try await survivor.value
+        do {
+            try await cancelled.value
+            XCTFail("Cancelled caller must not report success")
+        } catch { XCTAssertTrue(error is CancellationError) }
+    }
+
+    func testLastCancellationStopsInstallAndRetryWaitsForCleanup() async throws {
+        let gate = OrukeetInstallationTestGate()
+        let probe = OrukeetInstallationTestProbe()
+        let started = expectation(description: "first installation started")
+        let cancelledReturned = expectation(description: "lone caller returns promptly")
+        let retryStarted = expectation(description: "retry starts after cleanup")
+        let installation = OrukeetInstallation { _ in
+            let attempt = await probe.start()
+            if attempt == 1 {
+                started.fulfill()
+                await gate.wait()
+                await probe.end()
+                try Task.checkCancellation()
+                XCTFail("Last caller cancellation must cancel underlying work")
+            } else {
+                retryStarted.fulfill()
+                await probe.end()
+            }
+        }
+        let first = Task {
+            do { try await installation.install { _ in } } catch {
+                cancelledReturned.fulfill()
+                throw error
+            }
+        }
+        await fulfillment(of: [started], timeout: 2)
+        first.cancel()
+        await fulfillment(of: [cancelledReturned], timeout: 2)
+        let retry = Task { try await installation.install { _ in } }
+        await gate.open()
+        await fulfillment(of: [retryStarted], timeout: 2)
+        try await retry.value
+        do {
+            try await first.value
+            XCTFail("Cancelled caller must not report success")
+        } catch { XCTAssertTrue(error is CancellationError) }
+        let counts = await probe.counts()
+        XCTAssertEqual(counts.attempts, 2)
+        XCTAssertEqual(counts.maximumActive, 1)
+    }
+
     func testOrukeetHasItsOwnSelectionAndLanguages() throws {
         let model = try XCTUnwrap(SettingsFluidAudioModels.availableModels.first { $0.version == "orukeet" })
         XCTAssertEqual(model.name, "Orukeet (preview)")
@@ -103,4 +226,42 @@ final class OrukeetModelStoreTests: XCTestCase {
         }
     }
 
+}
+
+private actor OrukeetInstallationTestGate {
+    private var isOpen = false
+    private var receivedProgress = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var progressContinuation: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        if !isOpen { await withCheckedContinuation { continuation = $0 } }
+    }
+    func open() {
+        isOpen = true
+        continuation?.resume()
+        continuation = nil
+    }
+    func waitForProgress() async {
+        if !receivedProgress { await withCheckedContinuation { progressContinuation = $0 } }
+    }
+    func progressReceived() {
+        receivedProgress = true
+        progressContinuation?.resume()
+        progressContinuation = nil
+    }
+}
+
+private actor OrukeetInstallationTestProbe {
+    private var attempts = 0
+    private var active = 0
+    private var maximumActive = 0
+    func start() -> Int {
+        attempts += 1
+        active += 1
+        maximumActive = max(maximumActive, active)
+        return attempts
+    }
+    func end() { active -= 1 }
+    func counts() -> (attempts: Int, maximumActive: Int) { (attempts, maximumActive) }
 }
