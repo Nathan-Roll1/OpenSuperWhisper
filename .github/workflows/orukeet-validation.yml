@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: c79a2708d19290e6b2e9b4cbbc4249e913d3d602
+          ref: 47a92bb7f306f9ece1a79ea78b3121ad876334c6
           submodules: recursive
       - name: Record exact source and toolchain
         run: |
