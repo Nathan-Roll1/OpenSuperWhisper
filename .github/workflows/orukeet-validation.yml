@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: 406f75c0dfb71ce816fb5165b352f178facad4e9
+          ref: c79a2708d19290e6b2e9b4cbbc4249e913d3d602
           submodules: recursive
       - name: Record exact source and toolchain
         run: |
@@ -20,6 +20,24 @@ jobs:
           git rev-parse HEAD | tee evidence/source-head.txt
           xcodebuild -version | tee evidence/xcode-version.txt
           swift --version | tee evidence/swift-version.txt
+      - name: Configure opt-in real-engine validation
+        shell: bash
+        run: |
+          mkdir -p fixtures
+          for name in en de fr silence; do
+            curl --fail --retry 3 --location "https://raw.githubusercontent.com/Nathan-Roll1/muesli/5f03f1e/.validation-fixtures/$name.wav" -o "fixtures/$name.wav"
+          done
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          p = Path('OpenSuperWhisper.xcodeproj/xcshareddata/xcschemes/OpenSuperWhisper.xcscheme')
+          tree = ET.parse(p)
+          action = tree.getroot().find('TestAction')
+          action.set('shouldUseLaunchSchemeArgsEnv', 'NO')
+          variables = ET.SubElement(action, 'EnvironmentVariables')
+          ET.SubElement(variables, 'EnvironmentVariable', key='ORUKEET_AUDIO_DIR', value=str(Path('fixtures').resolve()), isEnabled='YES')
+          tree.write(p)
+          PYTHON
       - name: Prepare native dependencies
         shell: bash
         run: |
