@@ -91,9 +91,10 @@ enum OrukeetModelStore {
         from url: URL, expectedBytes: Int, progress: @escaping @Sendable (Double) -> Void
     ) async throws -> URL {
         try Task.checkCancellation()
+        guard expectedBytes > 0 else { throw CocoaError(.fileReadCorruptFile) }
         progress(0)
-        let delegate = DownloadProgress(expectedBytes: expectedBytes, progress: progress)
-        let (temporary, response) = try await URLSession.shared.download(from: url, delegate: delegate)
+        let transfer = DownloadTransfer(expectedBytes: expectedBytes, progress: progress)
+        let (temporary, response) = try await transfer.download(from: url)
         do {
             try validateHTTP(response)
             try Task.checkCancellation()
@@ -104,24 +105,75 @@ enum OrukeetModelStore {
         }
     }
 
-    private final class DownloadProgress: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
-        let expectedBytes: Int
-        let progress: @Sendable (Double) -> Void
+    // The async URLSession convenience does not forward download progress on macOS.
+    private final class DownloadTransfer: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+        private let expectedBytes: Int
+        private let progress: @Sendable (Double) -> Void
+        private let lock = NSLock()
+        private var task: URLSessionDownloadTask?
+        private var cancelled = false
+        private var continuation: CheckedContinuation<(URL, URLResponse), Error>?
+        // Both delegate callbacks run on URLSession's serial delegate queue.
+        private var result: Result<(URL, URLResponse), Error>?
 
         init(expectedBytes: Int, progress: @escaping @Sendable (Double) -> Void) {
             self.expectedBytes = expectedBytes
             self.progress = progress
         }
 
+        func download(from url: URL) async throws -> (URL, URLResponse) {
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    lock.withLock {
+                        guard !cancelled else {
+                            continuation.resume(throwing: CancellationError())
+                            return
+                        }
+                        self.continuation = continuation
+                        let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+                        let task = session.downloadTask(with: url)
+                        self.task = task
+                        task.resume()
+                    }
+                }
+            } onCancel: {
+                self.lock.withLock {
+                    self.cancelled = true
+                    self.task?.cancel()
+                }
+            }
+        }
+
         func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                         didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
                         totalBytesExpectedToWrite: Int64) {
-            // Use the verified manifest even when an HF redirect omits Content-Length.
+            // The pinned manifest supplies a length even when an HF redirect does not.
             progress(min(0.9, max(0, Double(totalBytesWritten) / Double(expectedBytes) * 0.9)))
         }
 
         func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
-                        didFinishDownloadingTo location: URL) {}
+                        didFinishDownloadingTo location: URL) {
+            result = Result {
+                guard let response = downloadTask.response else { throw URLError(.badServerResponse) }
+                let retained = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("OrukeetDownload-\(UUID().uuidString)")
+                try FileManager.default.moveItem(at: location, to: retained)
+                return (retained, response)
+            }
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            if let error {
+                if case .success(let (url, _)) = result { try? FileManager.default.removeItem(at: url) }
+                result = .failure(error)
+            }
+            let completion = lock.withLock {
+                defer { continuation = nil; self.task = nil }
+                return continuation
+            }
+            completion?.resume(with: result ?? .failure(URLError(.badServerResponse)))
+            session.finishTasksAndInvalidate()
+        }
     }
 
     /// Separate from acquisition so the exact installer can be regression-tested with the pinned archive offline.
