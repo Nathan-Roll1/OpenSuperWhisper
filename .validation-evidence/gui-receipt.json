@@ -1,0 +1,30 @@
+{
+  "source_commit": "c79a2708d19290e6b2e9b4cbbc4249e913d3d602",
+  "artifact_run": "https://github.com/Nathan-Roll1/OpenSuperWhisper/actions/runs/35279115147",
+  "local_bundle_id": "ru.starmel.OpenSuperWhisper.OrukeetValidation",
+  "local_packaging_changes": [
+    "isolated CFBundleIdentifier",
+    "ad-hoc code signature"
+  ],
+  "fixture": "hasCompletedOnboarding boolean in isolated preferences",
+  "granted_permissions": [],
+  "gui_checks": [
+    "catalog shows optional Orukeet preview",
+    "production HF acquisition progressed from0 to0.0729958641 to0.6325761429",
+    "installation selected Orukeet and showed separate cache"
+  ],
+  "file_import": {
+    "source": "Google FLEURS en_us-1003119935936341070.wav, CC BY4.0",
+    "entrypoint": "application open-file handler",
+    "verification": "read-only isolated recording database",
+    "records": [
+      {
+        "fileName": "FD96A6CB-4EE2-4801-BDFD-280272630BE1.wav",
+        "transcription": "However, due to the slow communication channels, styles in the West could lag behind by twenty-five to thirty years.",
+        "status": "completed",
+        "progress": 1.0
+      }
+    ]
+  },
+  "limitation": "Main recording view remained behind existing microphone/Accessibility permission gate. No transcript-view screenshot or microphone capture claim. File import completed through the actual app and stored expected text."
+}

@@ -2,6 +2,7 @@ name: Orukeet Xcode validation
 on:
   push:
     branches: [codex/orukeet-validation]
+    paths: ['.github/workflows/orukeet-validation.yml']
   workflow_dispatch:
 permissions:
   contents: read
