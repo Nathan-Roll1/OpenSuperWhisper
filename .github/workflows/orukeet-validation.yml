@@ -1,0 +1,51 @@
+name: Orukeet Xcode validation
+on:
+  push:
+    branches: [codex/orukeet-validation]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: bb93c6871df2c77edb5f512f5af3099131b468fe
+          submodules: recursive
+      - name: Record exact source and toolchain
+        run: |
+          mkdir -p evidence
+          git rev-parse HEAD | tee evidence/source-head.txt
+          xcodebuild -version | tee evidence/xcode-version.txt
+          swift --version | tee evidence/swift-version.txt
+      - name: Prepare native dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install cmake libomp
+          cmake -G Xcode -B libwhisper/build -S libwhisper
+          mkdir -p build
+          CARGO_PROFILE_RELEASE_LTO=true CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_STRIP=symbols CARGO_PROFILE_RELEASE_PANIC=abort cargo build -p autocorrect-swift --release --target aarch64-apple-darwin --manifest-path=libautocorrect/Cargo.toml
+          cp libautocorrect/target/aarch64-apple-darwin/release/libautocorrect_swift.dylib build/
+          install_name_tool -id '@rpath/libautocorrect_swift.dylib' build/libautocorrect_swift.dylib
+          codesign --force --sign - build/libautocorrect_swift.dylib
+          cp /opt/homebrew/opt/libomp/lib/libomp.dylib build/
+          install_name_tool -id '@rpath/libomp.dylib' build/libomp.dylib
+          codesign --force --sign - build/libomp.dylib
+      - name: Build complete app and focused tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -scheme OpenSuperWhisper -configuration Debug -jobs 4 -derivedDataPath build -destination 'platform=macOS,arch=arm64' -skipPackagePluginValidation -skipMacroValidation -clonedSourcePackagesDirPath SourcePackages CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY='' CODE_SIGNING_REQUIRED=NO build | tee evidence/xcode-build.log
+          xcodebuild -scheme OpenSuperWhisper -configuration Debug -jobs 4 -derivedDataPath build -destination 'platform=macOS,arch=arm64' -skipPackagePluginValidation -skipMacroValidation -clonedSourcePackagesDirPath SourcePackages CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY='' CODE_SIGNING_REQUIRED=NO -only-testing:OpenSuperWhisperTests/OrukeetModelStoreTests -only-testing:OpenSuperWhisperTests/LanguageSupportTests -only-testing:OpenSuperWhisperTests/DownloadCancellationTests -only-testing:OpenSuperWhisperTests/EngineLoadingTests test | tee evidence/xcode-tests.log
+      - name: Archive actual app preserving symlinks
+        if: success()
+        run: ditto -c -k --sequesterRsrc --keepParent build/Build/Products/Debug/OpenSuperWhisper.app evidence/OpenSuperWhisper.zip
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: OpenSuperWhisper-orukeet-validation
+          path: evidence/
+          retention-days: 14
